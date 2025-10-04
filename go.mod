@@ -1,4 +1,4 @@
-module go-ChiProxy
+module go-ChiiProxy
 
 go 1.25.1
 
