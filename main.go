@@ -11,45 +11,98 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"time"
 
 	"github.com/fatih/color"
 )
 
-// customRoundTripperは、リクエスト送信直前の最終調整（ヘッダー操作など）とロギングを担う
+// customRoundTripperは、リクエストとレスポンスのロギングと、通信の実行を担う
 type customRoundTripper struct {
-	logger  *slog.Logger
-	proxied http.RoundTripper
-	// 色付け用の関数
+	logger    *slog.Logger
+	proxied   http.RoundTripper
 	reqColor  func(a ...interface{}) string
 	respColor func(a ...interface{}) string
 }
 
+// RoundTrip は http.RoundTripper インターフェースを実装します。
 func (crt *customRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// 1. 最終調整：ReverseProxyが自動追加したX-Forwarded-Forヘッダーを削除
+	startTime := time.Now()
+
+	// ReverseProxyが自動追加したX-Forwarded-Forヘッダーを削除
 	req.Header.Del("X-Forwarded-For")
 
-	// 2. 記録：送信直前のリクエストをログに出力
-	//    この時点ではヘッダーが削除されているため、ログにも出力されない
-	var body []byte
+	// --- リクエストのロギング ---
+	var reqBody []byte
 	if req.Body != nil {
-		body, _ = io.ReadAll(req.Body)
-		req.Body.Close()
+		var err error
+		reqBody, err = io.ReadAll(req.Body)
+		if err != nil {
+			crt.logger.Error("リクエストボディの読み込みに失敗しました", "エラー", err)
+			return nil, err
+		}
 	}
-	req.Body = io.NopCloser(bytes.NewBuffer(body))
+	// オリジナルのリクエストのボディを復元。これは後ほどサーバに転送されるため。
+	req.Body = io.NopCloser(bytes.NewBuffer(reqBody))
 
+	// ログ出力専用にリクエストを複製（クローン）する
 	logReq := req.Clone(req.Context())
-	logReq.Body = io.NopCloser(bytes.NewBuffer(body))
-	reqDump, _ := httputil.DumpRequestOut(logReq, true)
+	// 複製したリクエストにも、新しいボディを設定する
+	logReq.Body = io.NopCloser(bytes.NewBuffer(reqBody))
 
-	crt.logger.Info("プロキシからサーバーへのリクエスト", "target", req.URL.String())
-	fmt.Println("┌--- [プロキシからサーバーへのリクエスト内容] ---")
-	fmt.Println(crt.reqColor(string(reqDump)))
-	fmt.Println("└------------------------------------------")
+	// 複製したリクエストをダンプする（こちらのボディだけが消費される）
+	reqDump, err := httputil.DumpRequestOut(logReq, true)
+	if err != nil {
+		crt.logger.Error("リクエストのダンプに失敗しました", "エラー", err)
+	} else {
+		crt.logger.Info("プロキシからサーバーへのリクエスト", "method", req.Method, "target", req.URL.String())
+		fmt.Println("┌--- [プロキシからサーバーへのリクエスト内容] ---")
+		fmt.Println(crt.reqColor(string(reqDump)))
+		fmt.Println("└------------------------------------------")
+	}
 
-	// 3. 本来の責務：実際にリクエストを送信する
-	return crt.proxied.RoundTrip(req)
+	// --- 実際にリクエストを送信 ---
+	// オリジナルのリクエスト（ボディは未読の状態）を渡す
+	resp, err := crt.proxied.RoundTrip(req)
+	duration := time.Since(startTime)
+
+	// ネットワークエラーなど、レスポンスが取得できなかった場合のエラーハンドリング
+	if err != nil {
+		crt.logger.Error("ターゲットへのリクエストが失敗しました", "エラー", err, "処理時間", duration)
+		return nil, err
+	}
+
+	// --- レスポンスのロギング ---
+	var respBody []byte
+	if resp.Body != nil {
+		var readErr error
+		respBody, readErr = io.ReadAll(resp.Body)
+		if readErr != nil {
+			crt.logger.Error("レスポンスボディの読み込みに失敗しました", "エラー", readErr)
+			return resp, readErr
+		}
+	}
+	// オリジナルのレスポンスのボディを復元。これは最終的にクライアントに返されるため。
+	resp.Body = io.NopCloser(bytes.NewBuffer(respBody))
+
+	// ログ出力用にレスポンスのシャローコピーを作成
+	logResp := *resp
+	// コピーしたレスポンスに、新しいボディを設定する
+	logResp.Body = io.NopCloser(bytes.NewBuffer(respBody))
+
+	// コピーしたレスポンスをダンプする（こちらのボディだけが消費される）
+	respDump, err := httputil.DumpResponse(&logResp, true)
+	if err != nil {
+		crt.logger.Error("レスポンスのダンプに失敗しました", "エラー", err)
+	} else {
+		crt.logger.Info("サーバーからのレスポンス", "status", resp.Status, "処理時間", duration)
+		fmt.Println("┌--- [サーバーからのレスポンス内容] ---")
+		fmt.Println(crt.respColor(string(respDump)))
+		fmt.Println("└------------------------------------")
+	}
+
+	// オリジナルのレスポンス（ボディは未読の状態）を返す
+	return resp, nil
 }
-
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
@@ -69,13 +122,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ★★★ 色付け用のオブジェクトを作成
 	reqColorPrinter := color.New(color.FgCyan).SprintFunc()
 	respColorPrinter := color.New(color.FgYellow).SprintFunc()
 
 	// 実際に通信を行う、標準のTransportを作成
 	baseTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // insecureフラグを適用
 	}
 
 	// 標準Transportを、自作のロギング用Transportでラップする
@@ -86,68 +138,49 @@ func main() {
 		respColor: respColorPrinter,
 	}
 
-	// Director: リクエストを書き換える関数
 	director := func(req *http.Request) {
-		// 転送先情報をリクエストに設定
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
 		req.URL.Path = target.Path
-		req.Host = target.Host // Hostヘッダーも明示的に設定
-	}
-
-	modifyResponse := func(resp *http.Response) error {
-		var body []byte
-		if resp.Body != nil {
-			body, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
-		}
-
-		logger.Info("サーバーからのレスポンス", "status", resp.Status)
-
-		logResp := *resp
-		logResp.Body = io.NopCloser(bytes.NewBuffer(body))
-		respDump, _ := httputil.DumpResponse(&logResp, true)
-
-		fmt.Println("┌--- [サーバーからのレスポンス内容] ---")
-		fmt.Println(respColorPrinter(string(respDump)))
-		fmt.Println("└------------------------------------")
-
-		resp.Body = io.NopCloser(bytes.NewBuffer(body))
-		return nil
+		req.Host = target.Host
 	}
 
 	proxy := &httputil.ReverseProxy{
-		Director:       director,
-		Transport:      customTransport, // Transportに、自作したロギング用Transportを設定
-		ModifyResponse: modifyResponse,
+		Director:  director,
+		Transport: customTransport, // 自作したロギング用Transportを設定
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Error("プロキシ処理中にエラーが発生しました", "エラー", err)
+			http.Error(w, "プロキシ エラー", http.StatusBadGateway)
+		},
 	}
 
+	// このハンドラはクライアントからの初回リクエストのみをログに出力する
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body []byte
-		// r.Bodyがnilでないことを確認してから読み込む
 		if r.Body != nil {
 			var err error
 			body, err = io.ReadAll(r.Body)
 			if err != nil {
-				logger.Error("リクエストボディの読み込みに失敗しました", "エラー", err)
+				logger.Error("クライアントからのリクエストボディ読み込みに失敗しました", "エラー", err)
 				http.Error(w, "Server Error", http.StatusInternalServerError)
 				return
 			}
 			r.Body.Close()
 		}
 
-		// クライアントからのリクエスト内容をログに出力
-		logger.Info("クライアントからのリクエスト", "method", r.Method, "path", r.URL.Path)
-		logReq := r.Clone(r.Context()) // リクエストを複製
+		logger.Info("クライアントからのリクエストを受信", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+		logReq := r.Clone(r.Context())
 		logReq.Body = io.NopCloser(bytes.NewBuffer(body))
-		reqDump, _ := httputil.DumpRequest(logReq, true)
+		reqDump, err := httputil.DumpRequest(logReq, true)
+		if err != nil {
+			logger.Error("クライアントリクエストのダンプに失敗しました", "エラー", err)
+		} else {
+			fmt.Println("┌--- [クライアントからのリクエスト内容] ---")
+			fmt.Println(reqColorPrinter(string(reqDump)))
+			fmt.Println("└--------------------------------------")
+		}
 
-		fmt.Println("┌--- [クライアントからのリクエスト内容] ---")
-		fmt.Println(reqColorPrinter(string(reqDump)))
-		fmt.Println("└--------------------------------------")
-
-		// プロキシにリクエストを渡す
-		r.Body = io.NopCloser(bytes.NewBuffer(body)) // bodyが空でも問題ない
+		r.Body = io.NopCloser(bytes.NewBuffer(body))
 		proxy.ServeHTTP(w, r)
 	})
 
