@@ -1,0 +1,27 @@
+┌---【検証1】HTTPSのSOAPサーバへの転送テスト------------------------------
+[ターミナル1]
+.\go-ChiProxy.exe -target "https://www.dataaccess.com/webservicesserver/numberconversion.wso"
+
+[ターミナル2]
+curl -X POST -H "Content-Type: text/xml; charset=utf-8" -d @request.xml http://localhost:8080/
+└------------------------------------------
+
+┌---【検証2】HTTPサーバへの転送テスト------------------------------
+[ターミナル1]
+.\go-ChiProxy.exe -target "http://httpbin.org/post"
+
+[ターミナル2]
+curl -X POST "http://localhost:8080/" -H "accept: application/json" -d "testdata=hello_proxy"
+└------------------------------------------
+
+┌---【検証3】自己署名証明書を持つHTTPSサーバへの接続テスト------------------------------
+[ターミナル2]
+curl https://self-signed.badssl.com/
+curl: (60) schannel: SEC_E_UNTRUSTED_ROOT (0x80090325) - 信頼されていない機関によって証明書チェーンが発行されました。
+
+[ターミナル1]
+.\go-ChiProxy.exe -target "https://self-signed.badssl.com"
+
+[ターミナル2]
+curl http://localhost:8080/
+└------------------------------------------
