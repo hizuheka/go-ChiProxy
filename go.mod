@@ -1,4 +1,4 @@
-module go-ChiiProxy
+module go-ObuKushi
 
 go 1.25.1
 
